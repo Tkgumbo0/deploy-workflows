@@ -1,5 +1,4 @@
 name: Deploy to S3
-
 on:
   workflow_call:
     secrets:
@@ -11,15 +10,14 @@ on:
         required: true
       AWS_REGION:
         required: true
-
 jobs:
   deploy:
     name: Sync to S3
     runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.head_commit.message, '[no-deploy]') }}
     steps:
       - name: Checkout calling repo
         uses: actions/checkout@v4
-
       - name: Read deploy config
         id: config
         run: |
@@ -27,31 +25,24 @@ jobs:
             echo "❌ deploy.config.json not found in repo root"
             exit 1
           fi
-
           S3_FOLDER=$(jq -r '.s3Folder' deploy.config.json)
-
           if [ -z "$S3_FOLDER" ] || [ "$S3_FOLDER" = "null" ]; then
             echo "❌ s3Folder not set in deploy.config.json"
             exit 1
           fi
-
           echo "s3_folder=$S3_FOLDER" >> "$GITHUB_OUTPUT"
           echo "📁 Target S3 folder: $S3_FOLDER"
-
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
-
       - name: Sync to S3
         run: |
           BUCKET="${{ secrets.S3_BUCKET_NAME }}"
           FOLDER="${{ steps.config.outputs.s3_folder }}"
-
           echo "🚀 Syncing to s3://$BUCKET/$FOLDER/"
-
           aws s3 sync . "s3://$BUCKET/$FOLDER/" \
             --delete \
             --exclude ".git/*" \
@@ -60,6 +51,5 @@ jobs:
             --exclude "deploy.config.json" \
             --exclude "README.md" \
             --exclude "*.md"
-
           echo "✅ Done — s3://$BUCKET/$FOLDER/ is up to date"
           echo "🔗 https://cv-website-deployments.s3.ap-southeast-2.amazonaws.com/$FOLDER/"
