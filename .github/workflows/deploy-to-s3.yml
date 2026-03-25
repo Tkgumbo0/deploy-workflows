@@ -45,6 +45,7 @@ jobs:
           echo "🚀 Syncing to s3://$BUCKET/$FOLDER/"
           aws s3 sync . "s3://$BUCKET/$FOLDER/" \
             --delete \
+            --cache-control "max-age=60" \
             --exclude ".git/*" \
             --exclude ".github/*" \
             --exclude ".gitignore" \
