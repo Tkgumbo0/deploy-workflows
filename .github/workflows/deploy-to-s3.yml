@@ -2,55 +2,101 @@ name: Deploy to S3
 on:
   workflow_call:
     secrets:
-      AWS_ACCESS_KEY_ID:
-        required: true
-      AWS_SECRET_ACCESS_KEY:
-        required: true
-      S3_BUCKET_NAME:
-        required: true
-      AWS_REGION:
-        required: true
+      AWS_ACCESS_KEY_ID:     { required: true }
+      AWS_SECRET_ACCESS_KEY: { required: true }
+      S3_BUCKET_NAME:        { required: true }
+      AWS_REGION:            { required: true }
+
 jobs:
-  deploy:
-    name: Sync to S3
+  plan:
+    name: Plan targets
     runs-on: ubuntu-latest
     if: ${{ !contains(github.event.head_commit.message, '[no-deploy]') }}
+    outputs:
+      targets: ${{ steps.config.outputs.targets }}
     steps:
-      - name: Checkout calling repo
-        uses: actions/checkout@v4
-      - name: Read deploy config
-        id: config
+      - uses: actions/checkout@v4
+      - id: config
         run: |
           if [ ! -f deploy.config.json ]; then
-            echo "❌ deploy.config.json not found in repo root"
-            exit 1
+            echo "❌ deploy.config.json not found"; exit 1
           fi
-          S3_FOLDER=$(jq -r '.s3Folder' deploy.config.json)
-          if [ -z "$S3_FOLDER" ] || [ "$S3_FOLDER" = "null" ]; then
-            echo "❌ s3Folder not set in deploy.config.json"
-            exit 1
+
+          # Normalize: wrap legacy single-target shape into a targets array
+          TARGETS=$(jq -c '
+            (if .targets then .targets else [{ s3Folder, source, bucket }] end)
+            | map({
+                s3Folder: .s3Folder,
+                source:   (.source  // "."),
+                bucket:   (.bucket  // ""),
+                include:  (.include // []),
+                exclude:  (.exclude // [])
+              })
+          ' deploy.config.json)
+
+          if [ "$(echo "$TARGETS" | jq 'length')" = "0" ]; then
+            echo "❌ No targets in deploy.config.json"; exit 1
           fi
-          echo "s3_folder=$S3_FOLDER" >> "$GITHUB_OUTPUT"
-          echo "📁 Target S3 folder: $S3_FOLDER"
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+
+          # Validate each target has s3Folder
+          if echo "$TARGETS" | jq -e '.[] | select(.s3Folder == null or .s3Folder == "")' > /dev/null; then
+            echo "❌ Every target needs s3Folder"; exit 1
+          fi
+
+          echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
+          echo "📋 Planned targets:"
+          echo "$TARGETS" | jq .
+
+  deploy:
+    name: Sync → ${{ matrix.target.s3Folder }}
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.plan.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
+
       - name: Sync to S3
+        env:
+          DEFAULT_BUCKET: ${{ secrets.S3_BUCKET_NAME }}
+          TARGET_BUCKET:  ${{ matrix.target.bucket }}
+          FOLDER:         ${{ matrix.target.s3Folder }}
+          SOURCE:         ${{ matrix.target.source }}
+          INCLUDES:       ${{ toJson(matrix.target.include) }}
+          EXCLUDES:       ${{ toJson(matrix.target.exclude) }}
+          REGION:         ${{ secrets.AWS_REGION }}
         run: |
-          BUCKET="${{ secrets.S3_BUCKET_NAME }}"
-          FOLDER="${{ steps.config.outputs.s3_folder }}"
-          echo "🚀 Syncing to s3://$BUCKET/$FOLDER/"
-          aws s3 sync . "s3://$BUCKET/$FOLDER/" \
+          BUCKET="${TARGET_BUCKET:-$DEFAULT_BUCKET}"
+
+          ARGS=()
+
+          # If includes are specified, exclude-all then re-include the patterns
+          if [ "$(echo "$INCLUDES" | jq 'length')" -gt 0 ]; then
+            ARGS+=(--exclude "*")
+            while IFS= read -r p; do ARGS+=(--include "$p"); done < <(echo "$INCLUDES" | jq -r '.[]')
+          fi
+
+          # Per-target excludes
+          while IFS= read -r p; do
+            [ -n "$p" ] && ARGS+=(--exclude "$p")
+          done < <(echo "$EXCLUDES" | jq -r '.[]')
+
+          # Default excludes (last, so they win for these specific paths)
+          ARGS+=(--exclude ".git/*" --exclude ".github/*" --exclude ".gitignore")
+          ARGS+=(--exclude "deploy.config.json" --exclude "README.md" --exclude "*.md")
+
+          echo "🚀 $SOURCE → s3://$BUCKET/$FOLDER/"
+          aws s3 sync "$SOURCE" "s3://$BUCKET/$FOLDER/" \
             --delete \
             --cache-control "max-age=60" \
-            --exclude ".git/*" \
-            --exclude ".github/*" \
-            --exclude ".gitignore" \
-            --exclude "deploy.config.json" \
-            --exclude "README.md" \
-            --exclude "*.md"
-          echo "✅ Done — s3://$BUCKET/$FOLDER/ is up to date"
-          echo "🔗 https://cv-website-deployments.s3.ap-southeast-2.amazonaws.com/$FOLDER/"
+            "${ARGS[@]}"
+
+          echo "✅ https://$BUCKET.s3.$REGION.amazonaws.com/$FOLDER/"
