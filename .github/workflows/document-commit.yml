@@ -1,0 +1,58 @@
+name: Document commit
+on:
+  workflow_call:
+    secrets:
+      AWS_ACCESS_KEY_ID:     { required: true }
+      AWS_SECRET_ACCESS_KEY: { required: true }
+      AWS_REGION:            { required: true }
+
+jobs:
+  document:
+    name: Generate Slite docs
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.head_commit.message, '[no-doc]') }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Invoke githubDocGenerator
+        env:
+          REPO:         ${{ github.repository }}
+          AFTER:        ${{ github.event.after }}
+          BEFORE:       ${{ github.event.before }}
+          PUSHER:       ${{ github.event.pusher.name }}
+          HEAD_MESSAGE: ${{ toJson(github.event.head_commit.message) }}
+          COMMITS:      ${{ toJson(github.event.commits) }}
+        run: |
+          # Build the Lambda payload (same shape handlePush expects)
+          PAYLOAD=$(jq -c -n \
+            --arg     repo         "$REPO" \
+            --arg     after        "$AFTER" \
+            --arg     before       "$BEFORE" \
+            --arg     pusher       "$PUSHER" \
+            --argjson head_message "$HEAD_MESSAGE" \
+            --argjson commits      "$COMMITS" \
+            '{
+              mode:         "push",
+              repo:         $repo,
+              after:        $after,
+              before:       $before,
+              pusher:       $pusher,
+              head_message: $head_message,
+              commits:      $commits
+            }')
+
+          # Event = async fire-and-forget: doc generation never blocks or
+          # fails the build. Drop "--invocation-type Event" to run it
+          # synchronously if you want errors surfaced in the Actions log.
+          aws lambda invoke \
+            --function-name githubDocGenerator \
+            --invocation-type Event \
+            --cli-binary-format raw-in-base64-out \
+            --payload "$PAYLOAD" \
+            /tmp/doc-response.json
+
+          echo "📄 Doc generation queued for $REPO"
